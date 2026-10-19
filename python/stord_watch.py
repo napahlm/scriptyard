@@ -6,7 +6,7 @@ page itself fetches, so it needs no API registration and stays in step with the 
 
 Usage:
     pip install playwright && python -m playwright install --with-deps chromium
-    python3 stord_watch.py --topic <ntfy-topic> [--interval 60] [--max-minutes 0] [--start-ping]
+    python3 stord_watch.py --topic <ntfy-topic> [--interval 60] [--max-minutes 0] [--start-ping] [--heartbeat]
 """
 import argparse
 import asyncio
@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from playwright.async_api import async_playwright
 
@@ -92,6 +93,7 @@ async def main():
     ap.add_argument("--topic", help="ntfy.sh topic")
     ap.add_argument("--interval", type=int, default=60, help="seconds between checks")
     ap.add_argument("--max-minutes", type=float, default=0, help="exit cleanly after this long (0 = forever)")
+    ap.add_argument("--heartbeat", action="store_true", help="silent push after every check, as proof of life")
     ap.add_argument("--start-ping", action="store_true", help="send a low-priority 'running' push")
     args = ap.parse_args()
     deadline = time.time() + args.max_minutes * 60 if args.max_minutes else None
@@ -119,6 +121,9 @@ async def main():
                 print("max runtime reached, exiting", flush=True)
                 return
             print(f"[{now()}] not available", flush=True)
+            if args.heartbeat:
+                oslo = datetime.now(ZoneInfo("Europe/Oslo"))
+                notify(args.topic, "Stord check", f"{oslo:%H:%M}: no rooms yet for 20-21 Oct", "min")
             await asyncio.sleep(args.interval)
             try:
                 avail = await check(page)

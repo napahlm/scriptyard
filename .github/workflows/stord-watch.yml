@@ -11,7 +11,7 @@ on:
 
 concurrency:
   group: stord-watch
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   watch:
@@ -27,6 +27,6 @@ jobs:
           PING: ${{ github.event_name != 'schedule' && '--start-ping' || '' }}
         run: |
           set -o pipefail
-          python -u python/stord_watch.py --topic stord-955ec95512e9 --interval 60 --max-minutes 340 $PING 2>&1 | tee out.txt &
+          python -u python/stord_watch.py --topic stord-955ec95512e9 --interval 300 --max-minutes 340 --heartbeat $PING 2>&1 | tee out.txt &
           sleep 60; echo "::notice::$(head -c 500 out.txt | tr '\n' ' ')"
           wait $! || { echo "::error::$(tail -c 1500 out.txt | tr '\n' ' ')"; exit 1; }
