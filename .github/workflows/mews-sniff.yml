@@ -1,0 +1,19 @@
+name: mews-sniff
+# Temporary one-off discovery for stord-watch. Delete after use.
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/mews-sniff.yml", "python/mews_sniff.py"]
+jobs:
+  sniff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q playwright && python -m playwright install --with-deps chromium > /dev/null
+      - run: |
+          python -u python/mews_sniff.py "https://app.mews.com/distributor/4151883d-7521-43f9-8187-b1f500cf26fa?mewsStart=2026-10-20&mewsEnd=2026-10-21&language=en-GB" > out.txt 2>&1 || true
+          while IFS= read -r l; do echo "::warning::${l:0:1200}"; done < <(grep -vE "^\s*$" out.txt | head -10)
