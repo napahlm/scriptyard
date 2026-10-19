@@ -29,8 +29,11 @@ def post(endpoint, body):
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise urllib.error.URLError(f"{endpoint} HTTP {e.code}: {e.read()[:500]!r}") from e
 
 
 def find_key(obj, names):

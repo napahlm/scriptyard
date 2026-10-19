@@ -22,4 +22,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python python/stord_watch.py --topic stord-955ec95512e9 --interval 60 --max-minutes 340
+      - run: |
+          set -o pipefail
+          python -u python/stord_watch.py --topic stord-955ec95512e9 --interval 60 --max-minutes 340 2>&1 | tee out.txt || {
+            echo "::error::$(tail -c 1500 out.txt | tr '\n' ' ')"; exit 1; }
