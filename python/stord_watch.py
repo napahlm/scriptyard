@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Poll Stord Hotell (Mews booking engine) for 20-21 Oct availability and push a phone alert via ntfy.
+"""Poll Stord Hotell (Mews booking engine) for one night 20-21 Oct 2026 and push a phone alert via ntfy.
+
+Uses the same call the hotel's own booking widget makes (bookingEngine/v1/services/getAvailability).
 
 Usage:
-    python3 stord_watch.py --topic <your-secret-ntfy-topic>
-Install the ntfy app (iOS/Android), subscribe to the same topic, done.
+    python3 stord_watch.py --topic <ntfy-topic> [--interval 60] [--max-minutes 0]
 """
 import argparse
 import json
@@ -13,84 +14,51 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-API = "https://api.mews.com/api/distributor/v1"
-CONFIG_ID = "4151883d-7521-43f9-8187-b1f500cf26fa"  # "Hotellrom" booking engine on stord-hotell.no
-CLIENT = "stord-watch 1.0"
+API = "https://api.mews.com/api/bookingEngine/v1/services/getAvailability"
+BOOKING_ENGINE_ID = "4151883d-7521-43f9-8187-b1f500cf26fa"
+SERVICE_ID = "fb83c231-3de0-4a20-899a-b1f500cf2391"
+ENTERPRISE_ID = "0cbc3f32-5c82-430a-b5f6-b1d300a9cae7"
+CLIENT = "Mews Distributor 5965.0.0"
 # Hotel-local midnight (Europe/Oslo, UTC+2 until 25 Oct) expressed in UTC.
-START_UTC = "2026-10-19T22:00:00Z"  # arrival 20 Oct
-END_UTC = "2026-10-20T22:00:00Z"    # departure 21 Oct
-BOOK_URL = f"https://app.mews.com/distributor/{CONFIG_ID}?mewsStart=2026-10-20&mewsEnd=2026-10-21&language=en-GB"
+START_UTC = "2026-10-19T22:00:00.000Z"  # night of 20 Oct
+END_UTC = "2026-10-20T22:00:00.000Z"
+BOOK_URL = f"https://app.mews.com/distributor/{BOOKING_ENGINE_ID}?mewsStart=2026-10-20&mewsEnd=2026-10-21&language=en-GB"
 
 
-def post(endpoint, body):
+def now():
+    return f"{datetime.now(timezone.utc):%H:%M:%S}Z"
+
+
+def check():
+    body = {
+        "serviceId": SERVICE_ID,
+        "bookingEngineId": BOOKING_ENGINE_ID,
+        "startUtc": START_UTC,
+        "endUtc": END_UTC,
+        "enterpriseId": ENTERPRISE_ID,
+        "fullAmounts": False,
+        "languageCode": "en-GB",
+        "client": CLIENT,
+    }
     req = urllib.request.Request(
-        f"{API}/{endpoint}",
+        API,
         data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 "Origin": "https://app.mews.com", "Referer": "https://app.mews.com/"},
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
-            return json.load(r)
+            res = json.load(r)
     except urllib.error.HTTPError as e:
-        raise urllib.error.URLError(f"{endpoint} HTTP {e.code}: {e.read()[:500]!r}") from e
-
-
-def find_key(obj, names):
-    """Depth-first search for the first value under any of the given keys."""
-    if isinstance(obj, dict):
-        for k in names:
-            if isinstance(obj.get(k), str):
-                return obj[k]
-        obj = list(obj.values())
-    if isinstance(obj, list):
-        for v in obj:
-            hit = find_key(v, names)
-            if hit:
-                return hit
-    return None
-
-
-def resolve_hotel(cfg):
-    hotel = find_key(cfg, ("EnterpriseId", "HotelId"))
-    if not hotel:
-        sys.exit("Could not find hotel id in configuration response. Pass --hotel-id.\n" + json.dumps(cfg)[:2000])
-    return hotel
-
-
-def category_names(cfg):
-    names = {}
-
-    def walk(o):
-        if isinstance(o, dict):
-            if "Id" in o and isinstance(o.get("Name"), dict) and o.get("SpaceType"):
-                n = o["Name"]
-                names[o["Id"]] = n.get("en-GB") or n.get("en-US") or next(iter(n.values()), o["Id"])
-            for v in o.values():
-                walk(v)
-        elif isinstance(o, list):
-            for v in o:
-                walk(v)
-
-    walk(cfg)
-    return names
-
-
-def check(hotel_id):
-    res = post("hotels/getAvailability", {
-        "Client": CLIENT,
-        "ConfigurationId": CONFIG_ID,
-        "HotelId": hotel_id,
-        "StartUtc": START_UTC,
-        "EndUtc": END_UTC,
-        "CurrencyCode": "NOK",
-    })
-    cats = res.get("RoomCategoryAvailabilities") or res.get("RoomCategoryAvailabilites") or []
-    return [c for c in cats if c.get("AvailableRoomCount", 0) > 0 and c.get("RoomOccupancyAvailabilities")]
+        raise RuntimeError(f"HTTP {e.code}: {e.read()[:300]!r}") from e
+    cats = res["categoryAvailabilities"]
+    # Index 0 is the night starting START_UTC (20 Oct).
+    return [c for c in cats if c["availabilities"] and c["availabilities"][0] > 0], len(cats)
 
 
 def notify(topic, title, msg, priority="urgent"):
-    print(f"\a[{datetime.now():%H:%M:%S}] {title}: {msg}", flush=True)
+    print(f"\a[{now()}] {title}: {msg}", flush=True)
     if not topic:
         return
     req = urllib.request.Request(
@@ -107,41 +75,42 @@ def notify(topic, title, msg, priority="urgent"):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--topic", help="ntfy.sh topic (make it long and random)")
-    ap.add_argument("--interval", type=int, default=60, help="seconds between checks (default 60)")
-    ap.add_argument("--hotel-id", help="override hotel id if auto-detect fails")
+    ap.add_argument("--topic", help="ntfy.sh topic")
+    ap.add_argument("--interval", type=int, default=60, help="seconds between checks")
     ap.add_argument("--max-minutes", type=float, default=0, help="exit cleanly after this long (0 = forever)")
+    ap.add_argument("--start-ping", action="store_true", help="send a low-priority 'started' push")
     args = ap.parse_args()
 
-    cfg = post("configuration/get", {"Client": CLIENT, "Ids": [CONFIG_ID], "PrimaryId": CONFIG_ID})
-    hotel_id = args.hotel_id or resolve_hotel(cfg)
-    names = category_names(cfg)
-    print(f"Watching hotel {hotel_id}, 20-21 Oct, every {args.interval}s. Ctrl+C to stop.", flush=True)
-    notify(args.topic, "Stord watch started", "You will get an urgent alert when 20-21 Oct opens up.", "low")
+    avail, n = check()  # fail fast if the API call is broken
+    print(f"[{now()}] API OK, {n} room categories, watching every {args.interval}s", flush=True)
+    if args.start_ping:
+        notify(args.topic, "Stord watch running", f"Checking {n} room types every {args.interval}s.", "low")
 
-    failures = 0
     deadline = time.time() + args.max_minutes * 60 if args.max_minutes else None
+    failures = 0
     while True:
+        if datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z") > START_UTC:
+            print("arrival date passed, exiting", flush=True)
+            return
+        if avail:
+            rooms = sum(c["availabilities"][0] for c in avail)
+            notify(args.topic, "Stord Hotell 20-21 Oct AVAILABLE",
+                   f"{rooms} room(s) across {len(avail)} room type(s). Tap to book.")
+            return
         if deadline and time.time() > deadline:
             print("max runtime reached, exiting", flush=True)
             return
-        if datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") > START_UTC:
-            notify(args.topic, "Stord watch stopped", "Arrival date has passed.", "default")
-            return
+        print(f"[{now()}] not available", flush=True)
+        time.sleep(args.interval)
         try:
-            avail = check(hotel_id)
+            avail, n = check()
             failures = 0
-            if avail:
-                summary = ", ".join(f"{names.get(c['RoomCategoryId'], 'room')} x{c['AvailableRoomCount']}" for c in avail)
-                notify(args.topic, "Stord Hotell 20-21 Oct AVAILABLE", f"{summary}. Tap to book.")
-                return
-            print(f"[{datetime.now():%H:%M:%S}] not available", flush=True)
-        except (urllib.error.URLError, ValueError, KeyError) as e:
+        except Exception as e:  # keep polling through transient errors
+            avail = []
             failures += 1
-            print(f"[{datetime.now():%H:%M:%S}] error: {e}", file=sys.stderr, flush=True)
+            print(f"[{now()}] error: {e}", file=sys.stderr, flush=True)
             if failures == 5:
                 notify(args.topic, "Stord watch is failing", f"5 errors in a row, last: {e}", "high")
-        time.sleep(args.interval)
 
 
 if __name__ == "__main__":

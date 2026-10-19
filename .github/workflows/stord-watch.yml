@@ -22,7 +22,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: |
+      - env:
+          PING: ${{ github.event_name != 'schedule' && '--start-ping' || '' }}
+        run: |
           set -o pipefail
-          python -u python/stord_watch.py --topic stord-955ec95512e9 --interval 60 --max-minutes 340 2>&1 | tee out.txt || {
-            echo "::error::$(tail -c 1500 out.txt | tr '\n' ' ')"; exit 1; }
+          python -u python/stord_watch.py --topic stord-955ec95512e9 --interval 60 --max-minutes 340 $PING 2>&1 | tee out.txt &
+          sleep 20; echo "::notice::$(head -c 500 out.txt | tr '\n' ' ')"
+          wait $! || { echo "::error::$(tail -c 1500 out.txt | tr '\n' ' ')"; exit 1; }
