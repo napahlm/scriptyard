@@ -1,0 +1,25 @@
+name: stord-watch
+
+# Temporary: polls Stord Hotell for 20-21 Oct 2026 and pushes via ntfy. Delete after 21 Oct.
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/stord-watch.yml", "python/stord_watch.py"]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */5 * * *"
+
+concurrency:
+  group: stord-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python python/stord_watch.py --topic stord-955ec95512e9 --interval 60 --max-minutes 340
