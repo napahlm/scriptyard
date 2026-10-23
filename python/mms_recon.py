@@ -1064,8 +1064,72 @@ def _session_pgi(body, want):
     return b""
 
 
+class Desynchronised(BerError):
+    """A reply arrived whose invokeID is not the one we sent.
+
+    Raised rather than recovered from, because once the response stream is
+    off by one every later value is attributed to the wrong object and
+    nothing in the data says so.
+    """
+
+
+def pdu_invoke_id(pdu):
+    """The invokeID a reply is answering, or None.
+
+    The MMS ASN.1 is inconsistent here and that inconsistency is the bug
+    trap: in confirmed-RequestPDU and confirmed-ResponsePDU the invokeID is
+    an UNTAGGED universal INTEGER, while in confirmed-ErrorPDU and rejectPDU
+    it is context [0] (and OPTIONAL in rejectPDU).
+    """
+    if pdu.is_(CONTEXT, PDU_CONFIRMED_RESPONSE):
+        for f in ber_tlvs(pdu.value):
+            if f.cls == UNIVERSAL and f.num == 2:
+                return int.from_bytes(f.value, "big")
+        return None
+    if pdu.is_(CONTEXT, PDU_CONFIRMED_ERROR) or pdu.is_(CONTEXT, PDU_REJECT):
+        f = find_tlv(pdu.value, CONTEXT, 0)
+        if f is not None and not f.constructed:
+            return int.from_bytes(f.value, "big")
+    return None
+
+
+def mms_pdus_from_data(user_data):
+    """EVERY MMS PDU in a presentation user-data, as (context_id, pdu).
+
+    One frame can carry several PDV-lists, and an IEC 61850 device with
+    reporting enabled emits unsolicited informationReports whenever it likes
+    -- including in the same frame as a reply, or in a frame of their own
+    between a request and its answer. Taking only the first PDV-list drops
+    the rest without trace, and treating whatever arrives as the answer to
+    the last request desynchronises the stream permanently.
+    """
+    out = []
+    for ud in ber_tlvs(user_data):
+        if not ud.is_(APPLICATION, 1):
+            continue
+        for pdv in ber_tlvs(ud.value):
+            if pdv.cls != UNIVERSAL or pdv.num != 16:
+                continue
+            cid, sat = None, None
+            for f in ber_tlvs(pdv.value):
+                if f.cls == UNIVERSAL and f.num == 2:
+                    cid = int.from_bytes(f.value, "big")
+                elif f.is_(CONTEXT, 0):
+                    sat = f
+            if sat is None:
+                continue
+            pdu = first_tlv(sat.value)
+            if pdu is not None:
+                out.append((cid, pdu))
+    return out
+
+
 def mms_from_data(user_data):
-    """presentation fully-encoded-data -> the MMS PDU TLV."""
+    """presentation fully-encoded-data -> the FIRST MMS PDU TLV.
+
+    Kept for the association handshake, where exactly one PDU is expected.
+    Use mms_pdus_from_data on the data path.
+    """
     ud = find_tlv(user_data, APPLICATION, 1)
     if ud is None:
         raise BerError("no presentation user-data in frame")
@@ -1678,6 +1742,9 @@ class MmsClient:
         self.negotiated = {}
         self.cotp_tpdu_octets = TPDU_SIZES.get(tpdu_size, 1024)
         self.tpdu_negotiated = "proposed, not yet negotiated"
+        # Unsolicited PDUs the device sent us. Not errors: a device with
+        # reporting enabled is supposed to do this.
+        self.unsolicited = []
         self.latencies = []
         self._last = 0.0
 
@@ -1837,20 +1904,43 @@ class MmsClient:
         t0 = time.monotonic()
         self._send_cotp(SESSION_DT + pres_user_data(pdu, MMS_CONTEXT_ID),
                         label)
-        kind, cotp = self._recv_cotp()
-        self.latencies.append({"step": label,
-                               "ms": (time.monotonic() - t0) * 1000})
-        if self.progress:
-            self.progress(label)
-        if kind != "dt":
-            raise BerError(f"expected COTP DT, got {kind}")
-        skind, user_data = strip_session(cotp)
-        if skind != "data":
-            raise BerError(f"expected session data, got {skind}")
-        return mms_from_data(user_data)
+        want = self.invoke_id
+        # Read until the reply to THIS request arrives, setting aside any
+        # unsolicited PDU that turns up on the way.
+        for _ in range(64):
+            kind, cotp = self._recv_cotp()
+            if kind != "dt":
+                raise BerError(f"expected COTP DT, got {kind}")
+            skind, user_data = strip_session(cotp)
+            if skind != "data":
+                raise BerError(f"expected session data, got {skind}")
+            answer = None
+            for cid, pdu in mms_pdus_from_data(user_data):
+                if pdu.is_(CONTEXT, PDU_UNCONFIRMED):
+                    self.unsolicited.append({
+                        "after": label, "contextId": cid,
+                        "pdu": "unconfirmed-PDU", "hex": pdu.value.hex()})
+                    continue
+                got = pdu_invoke_id(pdu)
+                if got is None or got == want:
+                    answer = pdu
+                    continue
+                raise Desynchronised(
+                    f"reply carries invokeID {got} but {want} was sent; the "
+                    f"response stream is out of step and every later value "
+                    f"would be attributed to the wrong object")
+            if answer is not None:
+                self.latencies.append(
+                    {"step": label, "ms": (time.monotonic() - t0) * 1000})
+                if self.progress:
+                    self.progress(label)
+                return answer
+            # The frame held only unsolicited data; keep waiting for the
+            # actual reply rather than returning a report as the answer.
+        raise BerError("too many unsolicited PDUs while awaiting a reply")
 
     def send_raw_mms(self, mms_pdu, label="raw", context_id=None,
-                     expect_reply=True):
+                     expect_reply=True, timeout=None):
         """Send an arbitrary MMS PDU on an arbitrary presentation context.
 
         Used by the gated probes, which need to put a well-formed PDU on an
@@ -1864,12 +1954,26 @@ class MmsClient:
         self._send_cotp(SESSION_DT + pres_user_data(mms_pdu, cid), label)
         if not expect_reply:
             return None
+        # Silence is often the expected answer here, so the caller can ask
+        # for a shorter wait than the normal request timeout rather than
+        # stalling the run on every probe that is supposed to get nothing.
+        if timeout is not None:
+            try:
+                self.sock.settimeout(timeout)
+            except Exception:
+                pass
         try:
             kind, cotp = self._recv_cotp()
         except (socket.timeout, OSError):
             self.latencies.append({"step": label, "ms": None,
                                    "note": "no reply"})
             return None
+        finally:
+            if timeout is not None:
+                try:
+                    self.sock.settimeout(self.timeout)
+                except Exception:
+                    pass
         self.latencies.append({"step": label,
                                "ms": (time.monotonic() - t0) * 1000})
         if kind != "dt":
@@ -2205,8 +2309,9 @@ def probe_ctl_models(cli, domain, names, log=None):
                "meaning": CTL_MODEL.get(n, f"unknown-{n}"),
                "selectRequired": n in (2, 4)}
         out.append(rec)
-        if log:
-            log(f"    {label:34} {n} {rec['meaning']}")
+    # No per-object line here: the caller renders these as a column-aligned
+    # table. Printing them again with a fixed :34 field misaligned every row
+    # whose object name was longer than that.
     return out
 
 
@@ -2344,16 +2449,22 @@ def reduced_osi_probe(host, port, initiate, timeout, recorder,
 LAB_PROBES = {}
 
 
-def lab_probe(name, risk, summary):
+# What a probe needs collected before it can run. A probe that needs only
+# the association should not pay for a full data-model sweep to get there.
+LAB_NEEDS = {"none": 0, "domains": 1, "objects": 2}
+
+
+def lab_probe(name, risk, summary, needs="none"):
     def deco(fn):
-        LAB_PROBES[name] = {"fn": fn, "risk": risk, "summary": summary}
+        LAB_PROBES[name] = {"fn": fn, "risk": risk, "summary": summary,
+                            "needs": needs}
         return fn
     return deco
 
 
 @lab_probe("services", "low",
            "probe every MMS service, declared or not, and compare the "
-           "answers against the Initiate bitmap")
+           "answers against the Initiate bitmap", needs="none")
 def probe_declared_vs_actual(cli, args, R, out):
     """A declared service that refuses, or an undeclared one that answers.
 
@@ -2442,7 +2553,7 @@ def probe_declared_vs_actual(cli, args, R, out):
 
 @lab_probe("ctxid", "low",
            "send a well-formed MMS PDU on an undeclared presentation "
-           "context id")
+           "context id", needs="none")
 def probe_context_id(cli, args, R, out):
     """Does the presentation layer validate the context id?
 
@@ -2458,7 +2569,8 @@ def probe_context_id(cli, args, R, out):
     results = {}
     for cid in (0, 2, 4, 99):
         ud = cli.send_raw_mms(req_identify_pdu(cli), f"ctxid:{cid}",
-                              context_id=cid)
+                              context_id=cid,
+                              timeout=min(2.0, args.timeout))
         if ud is None:
             results[cid] = {"answered": False}
             out(f"    context id {cid:3}: no reply (expected)")
@@ -2481,7 +2593,8 @@ def probe_context_id(cli, args, R, out):
 
 
 @lab_probe("error-append", "low",
-           "measure how much the error response grows per failing item")
+           "measure how much the error response grows per failing item",
+           needs="domains")
 def probe_error_growth(cli, args, R, out):
     """Response growth per failing item in one request.
 
@@ -2521,7 +2634,8 @@ def probe_error_growth(cli, args, R, out):
 
 
 @lab_probe("pdu", "medium",
-           "send a request larger than the negotiated maximum PDU size")
+           "send a request larger than the negotiated maximum PDU size",
+           needs="none")
 def probe_pdu_boundary(cli, args, R, out):
     """How is an oversized request handled?
 
@@ -2621,7 +2735,8 @@ def _read_paths(cli, domain, item):
 
 @lab_probe("authz-matrix", "low",
            "read each object by name, by index and by index range, and "
-           "report any object where the three paths disagree")
+           "report any object where the three paths disagree",
+           needs="objects")
 def probe_authz_matrix(cli, args, R, out):
     """Does the access check live on only one of the read paths?
 
@@ -2982,9 +3097,22 @@ class Report:
         "bryellow": "\033[93m", "brcyan": "\033[96m",
     }
 
-    def __init__(self, quiet=False, color=None, stream=None):
+    def __init__(self, quiet=False, color=None, stream=None, tee=None):
         self.quiet = quiet
         self.stream = stream or sys.stdout
+        # The saved log is the primary artefact, so it keeps the colour: a
+        # plain-text dump of a coloured report loses the markers that make a
+        # finding findable. When a tee is active colour is forced on unless
+        # it was explicitly disabled, so the file and the terminal agree.
+        self.tee_fh = None
+        if tee:
+            try:
+                Path(tee).parent.mkdir(parents=True, exist_ok=True)
+                self.tee_fh = open(tee, "w", encoding="utf-8")
+                if color is None:
+                    color = True
+            except Exception as e:
+                print(f"[!] cannot write {tee}: {e}", file=sys.stderr)
         try:
             self.tty = self.stream.isatty()
         except Exception:
@@ -3078,27 +3206,48 @@ class Report:
 
     # -- permanent output -----------------------------------------------
     def __call__(self, line=""):
+        if self.tee_fh is not None:
+            try:
+                self.tee_fh.write(str(line) + "\n")
+                self.tee_fh.flush()
+            except Exception:
+                pass
         if self.quiet:
             return
         self.clear_status()
         self.stream.write(str(line) + "\n")
         self.stream.flush()
 
+    def close(self):
+        if self.tee_fh is not None:
+            try:
+                self.tee_fh.close()
+            except Exception:
+                pass
+            self.tee_fh = None
+
+    def retee(self, path):
+        """Point the saved log at a new file, for the next target in a sweep."""
+        self.close()
+        if not path:
+            return
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            self.tee_fh = open(path, "w", encoding="utf-8")
+        except Exception as e:
+            print(f"[!] cannot write {path}: {e}", file=sys.stderr)
+
     def rule(self, char=None):
         ch = char or self._glyph(self.G_RULE)
         self(self.c(ch * self._width(), "dim"))
 
     def head(self, title):
-        if self.quiet:
-            return
         self("")
         bar = self._glyph(self.G_HEAD)
         n = max(4, self._width() - len(title) - 5)
         self(self.c(f"{bar * 3} {title} {bar * n}", "bold", "brcyan"))
 
     def banner(self, lines):
-        if self.quiet:
-            return
         self("")
         for i, ln in enumerate(lines):
             self(self.c(ln, "bold", "brcyan") if i == 0 else self.c(ln, "dim"))
@@ -3129,8 +3278,6 @@ class Report:
 
     def note(self, text, indent=2):
         """Wrapped explanatory prose, dimmed so it reads as commentary."""
-        if self.quiet:
-            return
         width = self._width() - indent - 2
         for para in text.strip().split("\n\n"):
             words, line = para.split(), ""
@@ -3155,7 +3302,7 @@ class Report:
     def table(self, headers, rows, indent=2, styles=None):
         """Column-aligned table. styles maps a column index to a style tuple,
         or a callable taking the cell value and returning a style tuple."""
-        if self.quiet or not rows:
+        if not rows:
             return
         cols = len(headers)
         cells = [[("" if c is None else str(c)) for c in r] for r in rows]
@@ -3267,29 +3414,32 @@ examples
     mms_recon.py --dry-run
     mms_recon.py --list-probes
 
-  enumerate one device, thorough by default
-    mms_recon.py 192.0.2.10 --json out/relay.json
+  enumerate one device, saving the readable log
+    mms_recon.py 192.0.2.10 --save out/relay.log
 
-  sweep a list, one JSON per target plus index.json
+  the same, and also the machine-readable evidence
+    mms_recon.py 192.0.2.10 --save out/relay.log --json out/relay.json
+
+  sweep a list: one .log per target, sweep.log and index.json
     mms_recon.py --targets relays.txt --out sweep/
 
   collect as much as the device will give, for offline analysis
     mms_recon.py --targets relays.txt --out sweep/ --read-values
 
   a quick inventory instead of a full sweep
-    mms_recon.py 192.0.2.10 --quick --json out/quick.json
+    mms_recon.py 192.0.2.10 --quick --save out/quick.log
 
   check the version against advisory ranges you supply
-    mms_recon.py 192.0.2.10 --advisories advisories.json --json out/a.json
+    mms_recon.py 192.0.2.10 --advisories advisories.json --save out/a.log
 
   slow link, loaded device, or a serial or radio hop
     mms_recon.py 192.0.2.10 --rate 0.25 --timeout 30 --max-domains 8
 
-  fingerprint the stack, then compare the next device to it
-    mms_recon.py 192.0.2.10 --record sig.json
-    mms_recon.py 192.0.2.11 --signatures sig.json
+  fingerprint the stack only, no enumeration
+    mms_recon.py 192.0.2.10 --fingerprint --record sig.json
+    mms_recon.py 192.0.2.11 --fingerprint --signatures sig.json
 
-  lab work: probes that deviate from the protocol, named one by one
+  lab work: each probe collects only what it needs, nothing more
     mms_recon.py 192.0.2.10 --lab --probes services,ctxid,error-append
     mms_recon.py 192.0.2.10 --lab --probes authz-matrix --authz-max 200
     mms_recon.py 192.0.2.10 --lab --probes pool --pool-max 8
@@ -3419,9 +3569,21 @@ def build_parser():
                    help="extra logical node classes, whitespace separated")
     o.add_argument("--record", metavar="PATH",
                    help="write a signature stub for this device")
+    o.add_argument("--fingerprint", action="store_true",
+                   help="stop after the negotiated parameters, Identify and "
+                        "the signature match. One association, a handful of "
+                        "requests, no enumeration. What --record and "
+                        "--signatures actually need")
     o.add_argument("--advisories", metavar="PATH",
                    help="advisory file to match the version against")
-    o.add_argument("--json", metavar="PATH", help="write the evidence file")
+    o.add_argument("--save", metavar="PATH",
+                   help="save the console output, colour and all, to this "
+                        "file. This is the readable record; in --out DIR "
+                        "mode it is written per target automatically")
+    o.add_argument("--json", metavar="PATH",
+                   help="ALSO write the machine-readable evidence file: raw "
+                        "hex of every frame, every enumerated name, "
+                        "latencies. Harder to read, better for scripting")
     o.add_argument("--color", dest="color", action="store_true", default=None,
                    help="force colour even when not a terminal")
     o.add_argument("--no-color", dest="color", action="store_false",
@@ -3459,7 +3621,7 @@ def scan_target(args, out, advisories, signatures, ln_classes, lab,
         "objects": {}, "flagged": [], "shape": [], "fileDirectory": {},
         "controlModels": {}, "proposedVsGranted": {}, "latencies": [],
         "labProbes": {}, "advisoryMatches": [], "values": {},
-        "valuesMeta": {},
+        "valuesMeta": {}, "unsolicited": [],
         "reducedOsi": {}, "serviceInterest": [], "signatureMatch": None,
         "errors": [], "wire": wire,
     }
@@ -3515,6 +3677,18 @@ def scan_target(args, out, advisories, signatures, ln_classes, lab,
     else:
         out.ok("read-only conformant requests only, nothing held or changed",
                indent=0)
+
+    # What the selected probes actually need. A probe wanting only the
+    # association should not trigger a full data-model sweep to reach it;
+    # only authz-matrix needs the enumerated objects.
+    probe_need = 2
+    if args.lab and selected:
+        probe_need = max((LAB_NEEDS[LAB_PROBES[n]["needs"]]
+                          for n in selected if n in LAB_PROBES), default=0)
+    full_scope = probe_need >= 2
+    if not full_scope:
+        out.info("gated probes only: skipping the data-model sweep, which "
+                 "none of them needs", indent=0)
 
     try:
         cli = new_client("primary")
@@ -3732,6 +3906,25 @@ def scan_target(args, out, advisories, signatures, ln_classes, lab,
                 out("  Name it, set don't-care bits in 'optional', and only")
                 out("  publish it for a device whose stack you can attest to.")
 
+            if args.fingerprint:
+                # Everything above comes from the Initiate response and one
+                # Identify. --record and --signatures need nothing more, so
+                # paying for a full enumeration to get a fingerprint was
+                # incidental rather than intended.
+                R["latencies"].extend(cli.latencies)
+                R["unsolicited"].extend(cli.unsolicited)
+                out("")
+                out.ok("fingerprint only: stopping before enumeration")
+                write_json()
+                out.head("SUMMARY")
+                out.kv("requests sent", out._requests)
+                out.kv("elapsed", f"{out.elapsed():.1f} s")
+                out.kv("services advertised",
+                       len(R["negotiated"].get("services", [])))
+                for k in ("vendor", "model", "revision"):
+                    out.kv(k, R["identify"].get(k, "(absent)"))
+                return R, 0
+
             # -- 6. domains and nameplate ------------------------------
             out.head("6. DOMAINS AND THE IEC 61850 NAMEPLATE")
             dom_res = enumerate_names(cli, object_class=9, log=out)
@@ -3741,7 +3934,8 @@ def scan_target(args, out, advisories, signatures, ln_classes, lab,
             out(f"  {len(domains)} domain(s): {domains[:12]}"
                 f"{' ...' if len(domains) > 12 else ''}")
 
-            for dom in domains[:args.max_domains]:
+            for dom in (domains[:args.max_domains] if full_scope
+                        else domains[:2]):
                 try:
                     num, value = cli.service_call(
                         req_get_domain_attributes(dom),
@@ -3761,7 +3955,7 @@ def scan_target(args, out, advisories, signatures, ln_classes, lab,
                     R["domainAttributes"][dom] = {"error": str(e)}
 
             out("")
-            for dom in domains[:args.max_domains]:
+            for dom in (domains[:args.max_domains] if full_scope else []):
                 for item, label in NAMEPLATE_ITEMS:
                     try:
                         vals = read_item(cli, dom, item)
@@ -3802,220 +3996,237 @@ def scan_target(args, out, advisories, signatures, ln_classes, lab,
                 out("  model, independently of Identify. It is still")
                 out("  vendor-populated, so it is evidence rather than proof.")
 
-            # -- 6b. control models ------------------------------------
-            out.head("6b. CONTROL MODELS (read-only, FC=CF)")
-            out("  Which control objects exist and how each expects to be")
-            out("  operated. Read at FC=CF, which is configuration; the")
-            out("  control model itself lives at FC=CO, where reading $SBO")
-            out("  would perform a SELECT.")
-            any_ctl = False
-            for dom in domains[:args.max_domains]:
-                res = R["objects"].get(f"{dom}/namedVariable")
-                if res is None:
-                    res = enumerate_names(cli, 0, dom, log=out)
-                    R["objects"][f"{dom}/namedVariable"] = res
-                models = probe_ctl_models(cli, dom, res["names"], log=out)
-                if models:
-                    any_ctl = True
-                    R["controlModels"][dom] = models
-                    out.table(["object", "ctlModel", "meaning", "select"],
-                              [[m2["object"], m2["ctlModel"], m2["meaning"],
-                                "required" if m2["selectRequired"] else "-"]
-                               for m2 in models], indent=4,
-                              styles={3: lambda v: ("bryellow",)
-                                      if v.strip() == "required" else ("dim",)})
-            if not any_ctl:
-                out("  no control objects found under FC=CO")
-            else:
-                sel = [m2 for v in R["controlModels"].values() for m2 in v
-                       if m2["selectRequired"]]
-                out("")
-                out(f"  {sum(len(v) for v in R['controlModels'].values())} "
-                    f"control object(s), {len(sel)} requiring "
-                    f"Select-before-Operate")
-                out("  Those are exactly the objects a careless FC=CO read")
-                out("  would have reserved. This tool never reads FC=CO.")
+            # Set before the gate: the summary reads it whether or not
+            # the sweep ran.
+            strong = []
 
-            # -- 7. object hunt ----------------------------------------
-            out.head("7. NON-IEC-61850 OBJECT HUNT")
-            classes = sorted(OBJECT_CLASSES) if args.deep else [0, 2, 9]
-            out(f"  object classes {classes}"
-                f"{'' if args.deep else '  (--deep for all)'}")
-
-            def hunt(scope, oc, res):
-                key = f"{scope}/{OBJECT_CLASSES[oc]}"
-                R["objects"][key] = res
-                if not res["names"]:
-                    return
-                strong = 0
-                for n in res["names"]:
-                    sig = classify_name(n, oc, ln_classes)
-                    if not sig:
-                        continue
-                    rank = highest_confidence(sig)
-                    rec = {"scope": scope, "class": OBJECT_CLASSES[oc],
-                           "name": n, "signals": sig,
-                           "confidence": ("high" if rank == 3
-                                          else "medium" if rank == 2
-                                          else "low")}
-                    R["flagged"].append(rec)
-                    if rank >= 2:
-                        strong += 1
-                        if strong <= 20:
-                            (out.alert if rank == 3 else out.flag)(
-                                f"{n}   [{rec['confidence']}]", indent=6)
-                            for s in sig:
-                                if s["confidence"] != "low":
-                                    out.info(s["signal"], indent=12)
-                out(f"    {key:38s} {len(res['names'])} name(s)"
-                    f"{f', {strong} notable' if strong else ''}")
-                if strong > 20:
-                    out(f"      ... {strong - 20} more notable, see --json")
-
-            for oc in classes:
-                hunt("vmd", oc, enumerate_names(cli, oc, None, log=out))
-            for dom in domains[:args.max_domains]:
-                for oc in classes:
-                    if oc == 9:
-                        continue
-                    hunt(dom, oc, enumerate_names(cli, oc, dom, log=out))
-
-            if advisories and R["nameplate"]:
-                # Section 2b ran before the nameplate existed and passed {},
-                # so every advisory keyed on a nameplate field such as swRev
-                # came back INDETERMINATE because of the ORDER OF THE REPORT,
-                # not because of anything the device said.
-                redone = match_advisories(advisories, R["identify"],
-                                          R["nameplate"])
-                before = {m2["advisory"]: m2["verdict"]
-                          for m2 in R["advisoryMatches"]}
-                changed = [m2 for m2 in redone
-                           if before.get(m2["advisory"]) != m2["verdict"]]
-                R["advisoryMatches"] = redone
-                if changed:
+            if full_scope:
+                # -- 6b. control models ------------------------------------
+                out.head("6b. CONTROL MODELS (read-only, FC=CF)")
+                out("  Which control objects exist and how each expects to be")
+                out("  operated. Read at FC=CF, which is configuration; the")
+                out("  control model itself lives at FC=CO, where reading $SBO")
+                out("  would perform a SELECT.")
+                any_ctl = False
+                for dom in domains[:args.max_domains]:
+                    res = R["objects"].get(f"{dom}/namedVariable")
+                    if res is None:
+                        res = enumerate_names(cli, 0, dom, log=out)
+                        R["objects"][f"{dom}/namedVariable"] = res
+                    models = probe_ctl_models(cli, dom, res["names"], log=out)
+                    if models:
+                        any_ctl = True
+                        R["controlModels"][dom] = models
+                        out.table(["object", "ctlModel", "meaning", "select"],
+                                  [[m2["object"], m2["ctlModel"], m2["meaning"],
+                                    "required" if m2["selectRequired"] else "-"]
+                                   for m2 in models], indent=4,
+                                  styles={3: lambda v: ("bryellow",)
+                                          if v.strip() == "required" else ("dim",)})
+                if not any_ctl:
+                    out("  no control objects found under FC=CO")
+                else:
+                    sel = [m2 for v in R["controlModels"].values() for m2 in v
+                           if m2["selectRequired"]]
                     out("")
-                    out("  advisory verdicts revised now the nameplate is "
-                        "known:")
-                    for m2 in changed:
-                        emit = {"IN_RANGE": out.alert,
-                                "INDETERMINATE": out.flag}.get(m2["verdict"],
-                                                               out.skip)
-                        emit(f"{m2['advisory']}: "
-                             f"{before.get(m2['advisory'])} -> "
-                             f"{m2['verdict']}", indent=4)
-                        for b in m2["because"]:
-                            out.info(b, indent=10)
+                    out(f"  {sum(len(v) for v in R['controlModels'].values())} "
+                        f"control object(s), {len(sel)} requiring "
+                        f"Select-before-Operate")
+                    out("  Those are exactly the objects a careless FC=CO read")
+                    out("  would have reserved. This tool never reads FC=CO.")
 
-            strong = [f for f in R["flagged"] if f["confidence"] != "low"]
-            weak = [f for f in R["flagged"] if f["confidence"] == "low"]
-            out("")
-            out(f"  {len(strong)} notable, {len(weak)} weak "
-                f"(unfamiliar logical node class only)")
-            if weak and args.show_weak:
-                for f in weak[:40]:
-                    out(f"      [low] {f['scope']}/{f['name']}")
-            elif weak:
-                out("  Weak flags are suppressed; --show-weak to see them.")
-                out("  They are usually logical node classes this tool does")
-                out("  not know, not vendor objects. Extend --ln-classes.")
-            if not strong:
-                out("")
-                out("  No high- or medium-confidence objects. Note the limit:")
-                out("  this covers the scopes enumerated, and says nothing")
-                out("  about objects reachable only after authentication.")
-            truncs = [k for k, v in R["objects"].items()
-                      if isinstance(v, dict) and v.get("truncated")]
-            if truncs:
-                out("")
-                out(f"  INCOMPLETE enumeration for: {', '.join(truncs)}")
-                out("  Treat the negative above as provisional.")
+                # -- 7. object hunt ----------------------------------------
+                out.head("7. NON-IEC-61850 OBJECT HUNT")
+                classes = sorted(OBJECT_CLASSES) if args.deep else [0, 2, 9]
+                out(f"  object classes {classes}"
+                    f"{'' if args.deep else '  (--deep for all)'}")
 
-            # -- 7b. values --------------------------------------------
-            if args.read_values:
-                out.head("7b. DATA ATTRIBUTE VALUES")
-                out.note("Reads the value of every enumerated attribute. "
-                         "FC=CO is refused by the guard, so control objects "
-                         "are skipped rather than selected.")
-                targets_v, seen_v = [], set()
-                for key, res in R["objects"].items():
-                    if not key.endswith("/namedVariable"):
-                        continue
-                    scope = key.split("/")[0]
-                    if scope == "vmd":
-                        continue
-                    for n in res.get("names", []):
-                        if (scope, n) not in seen_v:
-                            seen_v.add((scope, n))
-                            targets_v.append((scope, n))
-                cap_v = args.read_values_max or len(targets_v)
-                got, denied, skipped_v, failed = 0, 0, 0, 0
-                for vi, (dom, item) in enumerate(targets_v[:cap_v], 1):
-                    out.status(f"  values {vi}/{min(cap_v, len(targets_v))}: "
-                               f"{item}")
+                def hunt(scope, oc, res):
+                    key = f"{scope}/{OBJECT_CLASSES[oc]}"
+                    R["objects"][key] = res
+                    if not res["names"]:
+                        return
+                    strong = 0
+                    for n in res["names"]:
+                        sig = classify_name(n, oc, ln_classes)
+                        if not sig:
+                            continue
+                        rank = highest_confidence(sig)
+                        rec = {"scope": scope, "class": OBJECT_CLASSES[oc],
+                               "name": n, "signals": sig,
+                               "confidence": ("high" if rank == 3
+                                              else "medium" if rank == 2
+                                              else "low")}
+                        R["flagged"].append(rec)
+                        if rank >= 2:
+                            strong += 1
+                            if strong <= 20:
+                                (out.alert if rank == 3 else out.flag)(
+                                    f"{n}   [{rec['confidence']}]", indent=6)
+                                for s in sig:
+                                    if s["confidence"] != "low":
+                                        out.info(s["signal"], indent=12)
+                    out(f"    {key:38s} {len(res['names'])} name(s)"
+                        f"{f', {strong} notable' if strong else ''}")
+                    if strong > 20:
+                        out(f"      ... {strong - 20} more notable, see --json")
+
+                for oc in classes:
+                    hunt("vmd", oc, enumerate_names(cli, oc, None, log=out))
+                for dom in domains[:args.max_domains]:
+                    for oc in classes:
+                        if oc == 9:
+                            continue
+                        hunt(dom, oc, enumerate_names(cli, oc, dom, log=out))
+
+                if advisories and R["nameplate"]:
+                    # Section 2b ran before the nameplate existed and passed {},
+                    # so every advisory keyed on a nameplate field such as swRev
+                    # came back INDETERMINATE because of the ORDER OF THE REPORT,
+                    # not because of anything the device said.
+                    redone = match_advisories(advisories, R["identify"],
+                                              R["nameplate"])
+                    before = {m2["advisory"]: m2["verdict"]
+                              for m2 in R["advisoryMatches"]}
+                    changed = [m2 for m2 in redone
+                               if before.get(m2["advisory"]) != m2["verdict"]]
+                    R["advisoryMatches"] = redone
+                    if changed:
+                        out("")
+                        out("  advisory verdicts revised now the nameplate is "
+                            "known:")
+                        for m2 in changed:
+                            emit = {"IN_RANGE": out.alert,
+                                    "INDETERMINATE": out.flag}.get(m2["verdict"],
+                                                                   out.skip)
+                            emit(f"{m2['advisory']}: "
+                                 f"{before.get(m2['advisory'])} -> "
+                                 f"{m2['verdict']}", indent=4)
+                            for b in m2["because"]:
+                                out.info(b, indent=10)
+
+                strong = [f for f in R["flagged"] if f["confidence"] != "low"]
+                weak = [f for f in R["flagged"] if f["confidence"] == "low"]
+                out("")
+                out(f"  {len(strong)} notable, {len(weak)} weak "
+                    f"(unfamiliar logical node class only)")
+                if weak and args.show_weak:
+                    for f in weak[:40]:
+                        out(f"      [low] {f['scope']}/{f['name']}")
+                elif weak:
+                    out("  Weak flags are suppressed; --show-weak to see them.")
+                    out("  They are usually logical node classes this tool does")
+                    out("  not know, not vendor objects. Extend --ln-classes.")
+                if not strong:
+                    out("")
+                    out("  No high- or medium-confidence objects. Note the limit:")
+                    out("  this covers the scopes enumerated, and says nothing")
+                    out("  about objects reachable only after authentication.")
+                truncs = [k for k, v in R["objects"].items()
+                          if isinstance(v, dict) and v.get("truncated")]
+                if truncs:
+                    out("")
+                    out(f"  INCOMPLETE enumeration for: {', '.join(truncs)}")
+                    out("  Treat the negative above as provisional.")
+
+                # -- 7b. values --------------------------------------------
+                if args.read_values:
+                    out.head("7b. DATA ATTRIBUTE VALUES")
+                    out.note("Reads the value of every enumerated attribute. "
+                             "FC=CO is refused by the guard, so control objects "
+                             "are skipped rather than selected.")
+                    targets_v, seen_v = [], set()
+                    for key, res in R["objects"].items():
+                        if not key.endswith("/namedVariable"):
+                            continue
+                        scope = key.split("/")[0]
+                        if scope == "vmd":
+                            continue
+                        for n in res.get("names", []):
+                            if (scope, n) not in seen_v:
+                                seen_v.add((scope, n))
+                                targets_v.append((scope, n))
+                    cap_v = args.read_values_max or len(targets_v)
+                    got, denied, skipped_v, failed = 0, 0, 0, 0
+                    for vi, (dom, item) in enumerate(targets_v[:cap_v], 1):
+                        out.status(f"  values {vi}/{min(cap_v, len(targets_v))}: "
+                                   f"{item}")
+                        try:
+                            vals = read_item(cli, dom, item)
+                        except Refused:
+                            skipped_v += 1
+                            continue
+                        except (MmsServiceError, socket.timeout, OSError,
+                                BerError) as e:
+                            failed += 1
+                            R["values"][f"{dom}/{item}"] = {"error": str(e)[:90]}
+                            continue
+                        if (vals and isinstance(vals[0], dict)
+                                and "failure" in vals[0]):
+                            denied += 1
+                            R["values"][f"{dom}/{item}"] = {
+                                "failure": vals[0]["failure"]}
+                            continue
+                        got += 1
+                        R["values"][f"{dom}/{item}"] = vals
+                    out.clear_status()
+                    truncated_v = (len(targets_v) > cap_v)
+                    out.kv("attributes read", got)
+                    out.kv("refused by the device", denied,
+                           style=("bryellow",) if denied else ("dim",))
+                    out.kv("skipped (FC=CO)", skipped_v, style=("dim",))
+                    out.kv("read errors", failed,
+                           style=("bryellow",) if failed else ("dim",))
+                    if truncated_v:
+                        out.flag(f"stopped at --read-values-max "
+                                 f"{args.read_values_max} of {len(targets_v)}; "
+                                 f"the value set is INCOMPLETE")
+                    R["valuesMeta"] = {"attempted": min(cap_v, len(targets_v)),
+                                       "available": len(targets_v),
+                                       "truncated": truncated_v,
+                                       "read": got, "denied": denied,
+                                       "skippedControlObjects": skipped_v,
+                                       "errors": failed}
+
+                # -- 8. file directory -------------------------------------
+                if args.file_dir:
+                    out.head("8. FILE DIRECTORY")
                     try:
-                        vals = read_item(cli, dom, item)
-                    except Refused:
-                        skipped_v += 1
-                        continue
-                    except (MmsServiceError, socket.timeout, OSError,
-                            BerError) as e:
-                        failed += 1
-                        R["values"][f"{dom}/{item}"] = {"error": str(e)[:90]}
-                        continue
-                    if (vals and isinstance(vals[0], dict)
-                            and "failure" in vals[0]):
-                        denied += 1
-                        R["values"][f"{dom}/{item}"] = {
-                            "failure": vals[0]["failure"]}
-                        continue
-                    got += 1
-                    R["values"][f"{dom}/{item}"] = vals
-                out.clear_status()
-                truncated_v = (len(targets_v) > cap_v)
-                out.kv("attributes read", got)
-                out.kv("refused by the device", denied,
-                       style=("bryellow",) if denied else ("dim",))
-                out.kv("skipped (FC=CO)", skipped_v, style=("dim",))
-                out.kv("read errors", failed,
-                       style=("bryellow",) if failed else ("dim",))
-                if truncated_v:
-                    out.flag(f"stopped at --read-values-max "
-                             f"{args.read_values_max} of {len(targets_v)}; "
-                             f"the value set is INCOMPLETE")
-                R["valuesMeta"] = {"attempted": min(cap_v, len(targets_v)),
-                                   "available": len(targets_v),
-                                   "truncated": truncated_v,
-                                   "read": got, "denied": denied,
-                                   "skippedControlObjects": skipped_v,
-                                   "errors": failed}
+                        res = file_directory(cli, None, args.file_dir_limit, out)
+                        R["fileDirectory"] = res
+                        out(f"  {len(res['entries'])} entry/entries")
+                        for e in res["entries"][:30]:
+                            size = e.get("size")
+                            out(f"      {e.get('name', '?'):52s} "
+                                f"{'' if size is None else size}")
+                        if len(res["entries"]) > 30:
+                            out(f"      ... {len(res['entries']) - 30} more, "
+                                f"see --json")
+                    except MmsServiceError as e:
+                        out(f"  not available: {e}")
+                        R["fileDirectory"] = {"error": str(e)}
+                    except Exception as e:
+                        out(f"  [!] {e}")
+                        R["fileDirectory"] = {"error": str(e)}
 
-            # -- 8. file directory -------------------------------------
-            if args.file_dir:
-                out.head("8. FILE DIRECTORY")
-                try:
-                    res = file_directory(cli, None, args.file_dir_limit, out)
-                    R["fileDirectory"] = res
-                    out(f"  {len(res['entries'])} entry/entries")
-                    for e in res["entries"][:30]:
-                        size = e.get("size")
-                        out(f"      {e.get('name', '?'):52s} "
-                            f"{'' if size is None else size}")
-                    if len(res["entries"]) > 30:
-                        out(f"      ... {len(res['entries']) - 30} more, "
-                            f"see --json")
-                except MmsServiceError as e:
-                    out(f"  not available: {e}")
-                    R["fileDirectory"] = {"error": str(e)}
-                except Exception as e:
-                    out(f"  [!] {e}")
-                    R["fileDirectory"] = {"error": str(e)}
 
         R["latencies"].extend(cli.latencies)
+        R["unsolicited"].extend(cli.unsolicited)
+        if cli.unsolicited:
+            out("")
+            out.flag(f"{len(cli.unsolicited)} unsolicited PDU(s) arrived "
+                     f"during the scan")
+            out.note("The device pushed data we did not ask for, which means "
+                     "reporting is enabled and something is enrolled. The "
+                     "raw PDUs are in the evidence under 'unsolicited'. "
+                     "Worth noting in the report: whatever that stream is, "
+                     "it reaches the master station's MMS client, which is a "
+                     "parser nobody tests.")
         out("\n[+] primary association closed with Conclude")
         write_json()
 
         # -- 9. data model shape --------------------------------------
-        if args.deep:
+        if args.deep and full_scope:
             time.sleep(args.settle)
             cli2 = new_client("shape probe")
             if cli2 is not None:
@@ -4212,6 +4423,10 @@ def scan_target(args, out, advisories, signatures, ln_classes, lab,
                style=("bold",) if sw else ("dim",))
         out.kv("reduced-OSI answered",
                R["reducedOsi"].get("answered", "not probed"))
+        if R["unsolicited"]:
+            out.kv("unsolicited PDUs", len(R["unsolicited"]),
+                   "reporting is enabled on this device",
+                   style=("bryellow", "bold"))
         lats = [x for x in R["latencies"] if x.get("ms") is not None]
         if lats:
             worst = max(lats, key=lambda x: x["ms"])
@@ -4308,7 +4523,7 @@ def main(argv=None):
     # expresses the opposite, because thorough is the default.
     args.deep = not args.quick
     args.file_dir = not args.no_file_dir
-    out = Report(args.quiet, color=args.color)
+    out = Report(args.quiet, color=args.color, tee=args.save)
     if args.no_progress:
         out.status = lambda *a, **k: None
         out.tick = lambda *a, **k: None
@@ -4404,7 +4619,10 @@ def main(argv=None):
         targs = argparse.Namespace(**vars(args))
         targs.host, targs.port = host, port
         if outdir:
-            targs.json = str(outdir / f"{target_slug(host, port)}.json")
+            slug = target_slug(host, port)
+            out.retee(str(outdir / f"{slug}.log"))
+            targs.json = (str(outdir / f"{slug}.json")
+                          if args.json or args.read_values else None)
         if len(targets) > 1:
             out("")
             out.rule()
@@ -4447,7 +4665,12 @@ def main(argv=None):
                  "finished": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                  "targets": roll}, indent=2, default=str))
 
+    if len(targets) == 1 and args.save:
+        out("")
+        out.kv("saved", args.save, "console output, colour preserved")
+
     if len(targets) > 1:
+        out.retee(str(outdir / "sweep.log") if outdir else None)
         out.head("ALL TARGETS")
         out.table(
             ["host:port", "vendor", "model", "svc", "dom", "obj", "ctl",
@@ -4467,8 +4690,9 @@ def main(argv=None):
                style=("bold",) if len(reached) == len(roll)
                else ("bryellow", "bold"))
         if outdir:
-            out.kv("evidence", str(outdir),
-                   "one JSON per target, plus index.json")
+            out.kv("output", str(outdir),
+                   "one .log per target, sweep.log, index.json")
+    out.close()
     return worst
 
 
